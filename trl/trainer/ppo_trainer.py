@@ -621,6 +621,7 @@ class PPOTrainer(BaseTrainer):
         responses: List[torch.LongTensor],
         scores: List[torch.FloatTensor],
         response_masks: Optional[List[torch.LongTensor]] = None,
+        last_hidden_state: Optional[torch.FloatTensor] = None,
     ):
         """
         Run a PPO optimisation step given a list of queries, model responses, and rewards.
@@ -634,6 +635,9 @@ class PPOTrainer(BaseTrainer):
                 List of tensors containing the scores.
             response_masks (List[`torch.FloatTensor`], *optional*)):
                 List of tensors containing masks of the response tokens.
+            last_hidden_state (`torch.FloatTensor`, *optional*):
+                Last hidden state of the model during response generation.
+                If provided, function is faster as a part of the computation is skipped.
 
         Returns:
             `dict[str, Any]`: A summary of the training statistics
@@ -703,19 +707,50 @@ class PPOTrainer(BaseTrainer):
                     pad_first=pad_first,
                 )
 
+        input_ids_key = "decoder_input_ids" if self.is_encoder_decoder else "input_ids"
+        if last_hidden_state is not None and model_inputs[input_ids_key].shape != last_hidden_state.shape[:2]:
+            raise ValueError(
+                f"Last hidden states (batch_size, length) shape {last_hidden_state.shape[:2]} "
+                f"does not match model inputs shape {model_inputs[input_ids_key].shape}"
+            )
+
         model_inputs_names = list(model_inputs.keys())
 
         full_kl_penalty = self.config.kl_penalty == "full"
 
         with torch.no_grad():
-            all_logprobs, logits_or_none, values, masks = self.batched_forward_pass(
-                self.model,
-                queries,
-                responses,
-                model_inputs,
-                response_masks=response_masks,
-                return_logits=full_kl_penalty,
-            )
+            if last_hidden_state is not None:
+                if last_hidden_state.device != self.model.v_head.summary.weight.device:
+                    last_hidden_state = last_hidden_state.to(self.model.v_head.summary.weight.device)
+
+                values = self.model.v_head(last_hidden_state).squeeze(-1)
+
+                for logits_head in self.model.lm_head_namings:
+                    if hasattr(self.model, logits_head):
+                        lm_logits = getattr(self.model, logits_head)(last_hidden_state)
+                        break
+
+                if lm_logits.dtype != torch.float32:
+                    lm_logits = lm_logits.float()
+
+                all_logprobs, logits_or_none, values, masks = self._postprocess_batch_model_outputs(
+                    model_inputs,
+                    queries,
+                    responses,
+                    lm_logits,
+                    values,
+                    response_masks
+                )
+
+            else:
+                all_logprobs, logits_or_none, values, masks = self.batched_forward_pass(
+                    self.model,
+                    queries,
+                    responses,
+                    model_inputs,
+                    response_masks=response_masks,
+                    return_logits=full_kl_penalty,
+                )
             with self.optional_peft_ctx():
                 ref_logprobs, ref_logits_or_none, _, _ = self.batched_forward_pass(
                     self.model if self.is_peft_model else self.ref_model,
@@ -975,6 +1010,7 @@ class PPOTrainer(BaseTrainer):
 
         model.eval()
 
+        response_masks_batch = None
         for i in range(math.ceil(bs / fbs)):
             input_kwargs = {key: value[i * fbs : (i + 1) * fbs] for key, value in model_inputs.items()}
             query_batch = queries[i * fbs : (i + 1) * fbs]
@@ -983,36 +1019,10 @@ class PPOTrainer(BaseTrainer):
                 response_masks_batch = response_masks[i * fbs : (i + 1) * fbs]
             logits, _, values = model(**input_kwargs)
 
-            if self.is_encoder_decoder:
-                input_ids = input_kwargs["decoder_input_ids"]
-                attention_mask = input_kwargs["decoder_attention_mask"]
-            else:
-                input_ids = input_kwargs["input_ids"]
-                attention_mask = input_kwargs["attention_mask"]
-
-            logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
-            masks = torch.zeros_like(attention_mask)
-            masks[:, :-1] = attention_mask[:, 1:]
-
-            for j in range(len(query_batch)):
-                if self.is_encoder_decoder:
-                    # Decoder sentence starts always in the index 1 after padding in the Enc-Dec Models
-                    start = 1
-                    end = attention_mask[j, :].sum() - 1
-                else:
-                    start = len(query_batch[j]) - 1  # logprobs starts from the second query token
-                    if attention_mask[j, 0] == 0:  # offset left padding
-                        start += attention_mask[j, :].nonzero()[0]
-                    end = start + len(response_batch[j])
-                    if response_masks is not None:
-                        response_masks_batch[j] = torch.cat(
-                            (torch.zeros_like(query_batch[j]), response_masks_batch[j])
-                        )[1:]
-
-                masks[j, :start] = 0
-                masks[j, end:] = 0
-                if response_masks is not None:
-                    masks[j, start:end] = masks[j, start:end] * response_masks_batch[j][start:end]
+            logits, logprobs, masks, values = self._postprocess_batch_model_outputs(
+                input_kwargs, query_batch, response_batch,
+                logits, values, response_masks_batch=response_masks_batch
+            )
 
             if return_logits:
                 all_logits.append(logits)
@@ -1024,10 +1034,58 @@ class PPOTrainer(BaseTrainer):
 
         return (
             torch.cat(all_logprobs),
-            torch.cat(all_logits)[:, :-1] if return_logits else None,
-            torch.cat(all_values)[:, :-1],
-            torch.cat(all_masks)[:, :-1],
+            torch.cat(all_logits) if return_logits else None,
+            torch.cat(all_values),
+            torch.cat(all_masks),
         )
+
+    def _postprocess_batch_model_outputs(
+        self,
+        model_inputs: dict,
+        query_batch: List[torch.LongTensor],
+        response_batch: List[torch.LongTensor],
+        logits: torch.FloatTensor,
+        values: torch.FloatTensor,
+        response_masks_batch: Optional[torch.Tensor] = None,
+    ):
+        if self.is_encoder_decoder:
+            input_ids = model_inputs["decoder_input_ids"]
+            attention_mask = model_inputs["decoder_attention_mask"]
+        else:
+            input_ids = model_inputs["input_ids"]
+            attention_mask = model_inputs["attention_mask"]
+
+        batch_size = input_ids.size(0)
+
+        logprobs = logprobs_from_logits(logits[:, :-1, :], input_ids[:, 1:])
+        masks = torch.zeros_like(attention_mask)
+        masks[:, :-1] = attention_mask[:, 1:]
+        for j in range(batch_size):
+            if self.is_encoder_decoder:
+                # Decoder sentence starts always in the index 1 after padding in the Enc-Dec Models
+                start = 1
+                end = attention_mask[j, :].sum() - 1
+            else:
+                start = len(query_batch[j]) - 1  # logprobs starts from the second query token
+                if attention_mask[j, 0] == 0:  # offset left padding
+                    start += attention_mask[j, :].nonzero()[0]
+                end = start + len(response_batch[j])
+                if response_masks_batch is not None:
+                    response_masks_batch[j] = torch.cat(
+                        (torch.zeros_like(query_batch[j]), response_masks_batch[j])
+                    )[1:]
+
+            masks[j, :start] = 0
+            masks[j, end:] = 0
+            if response_masks_batch is not None:
+                masks[j, start:end] = masks[j, start:end] * response_masks_batch[j][start:end]
+
+        logits = logits[:, :-1]
+        logprobs = logprobs[:, :-1]
+        masks = masks[:, :-1]
+        values = values[:, :-1]
+
+        return logits, logprobs, masks, values
 
     @PPODecorators.empty_device_cache()
     def train_minibatch(
